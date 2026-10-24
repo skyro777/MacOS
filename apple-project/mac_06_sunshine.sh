@@ -29,7 +29,12 @@ SUNSHINE_CONFIG_DIR="/Users/$RUNNER_USER/.config/sunshine"
 # Sunshine can be installed two ways:
 #   a) brew formula (LizardByte tap) — binary at /opt/homebrew/opt/sunshine/bin/sunshine
 #   b) DMG from GitHub releases — .app at /Applications/Sunshine.app
-# We try brew first (more reliable), then DMG fallback.
+# We try brew first (faster, no download), then DMG fallback.
+# IMPORTANT: The brew binary depends on Homebrew's qtbase, whose bottle version
+# can lag behind what Sunshine was compiled against (e.g. Sunshine needs Qt 6.12
+# but qtbase bottle is 6.11.2 → dyld "Symbol not found: _qt_version_tag_6_12"
+# crash on launch). The DMG bundles its own Qt frameworks, so it's version-stable
+# and is used as a robust fallback whenever the brew binary fails to serve.
 SUNSHINE_BIN=""
 SUNSHINE_BUNDLE="com.lizardbyte.sunshine"
 
@@ -101,7 +106,7 @@ for plist in "$sca_plist" "$sys_plist"; do
 done
 sudo killall -HUP replayd 2>/dev/null || true
 
-# --- 3. create config dir + set initial credentials ------------------------
+# --- 3. create config dir + write low-latency config ------------------------
 mkdir -p "$SUNSHINE_CONFIG_DIR"
 
 # Sunshine stores credentials in a JSON file (credentials_file in sunshine.conf)
@@ -110,9 +115,6 @@ mkdir -p "$SUNSHINE_CONFIG_DIR"
 SUNSHINE_USER="${SUNSHINE_USER:-admin}"
 SUNSHINE_PASS="${SUNSHINE_PASS:-sunshine}"
 
-# The credentials file is a simple JSON with hashed credentials.
-# Sunshine uses its own hashing. We'll create the config + let the web UI
-# handle the initial credential creation (more reliable than pre-hashing).
 # Get the Tailscale IP for the CSRF config
 TS_IP_FOR_CONFIG="$(cat "$STATE_DIR/tailscale-ip" 2>/dev/null || echo '0.0.0.0')"
 
@@ -121,10 +123,32 @@ cat > "$SUNSHINE_CONFIG_DIR/sunshine.conf" <<EOF
 origin_web_ui_allowed = wan
 csrf_allowed_origins = https://$TS_IP_FOR_CONFIG:47990, https://localhost:47990, https://127.0.0.1:47990
 
-# Use Sunshine DEFAULTS — don't override anything.
-# The defaults are well-tuned by LizardByte for smooth streaming.
-# Overriding them (bitrate, qp, fec, etc.) caused flickering + bad quality.
-# Moonlight client-side settings handle latency optimization.
+# --- LATENCY OPTIMIZATION (tuned: low latency + NO flickering) ---
+# These overrides give the LOWEST practical latency on macOS without the
+# flickering/blocky artifacts that the previous (too-conservative) values
+# caused. The earlier revert to "defaults" removed this low-latency tuning;
+# restored here per the requirement to not compromise on latency.
+#
+# encoder — VideoToolbox hardware encoder = lowest encoding latency on Apple
+#           Silicon (auto-selected by default, but pinning it guarantees we
+#           never fall back to slow software encoding).
+# max_bitrate — 50 Mbps cap. The old 10 Mbps caused blocky flicker on motion.
+#               50 Mbps is plenty for clean 1080p60 over a direct Tailscale link.
+# min_threads — 2 parallel encoding passes for faster frame turnaround.
+# hevc_mode — 0 (H.264 only). HEVC triggers mouse-cursor glitches on the
+#             Windows Moonlight client, so we force H.264.
+# fec_percentage — 20% forward error correction. The old 5% caused flicker
+#                  on lossy/relayed Tailscale paths; 20% (LizardByte default)
+#                  is the sweet spot for resilience without bloat.
+# qp — 18 (CQP constant-quality). Stable per-frame quality with no
+#       bitrate-buffer stutter. 0 would switch to VBR (can stutter);
+#       24 (old value) was too soft. 18 is high quality + low latency.
+encoder = videotoolbox
+max_bitrate = 50000
+min_threads = 2
+hevc_mode = 0
+fec_percentage = 20
+qp = 18
 EOF
 ok "config written to $SUNSHINE_CONFIG_DIR/sunshine.conf"
 
@@ -133,7 +157,7 @@ SUNSHINE_USER_VAL="${SUNSHINE_USER:-admin}"
 SUNSHINE_PASS_VAL="${SUNSHINE_PASS:-sunshine}"
 export SUNSHINE_USER_VAL SUNSHINE_PASS_VAL
 
-# --- 4. launch Sunshine -----------------------------------------------------
+# --- 4. launch Sunshine (robust: crash-detect + DMG fallback) ---------------
 log "launching Sunshine..."
 
 # Stop any brew services instance first (it runs as root, can't access GUI)
@@ -147,41 +171,124 @@ pkill -9 -f "sunshine" 2>/dev/null || true
 sudo pkill -9 -f "sunshine" 2>/dev/null || true
 sleep 3
 
-# Launch Sunshine DIRECTLY as the GUI user (NOT via brew services).
-# brew services runs as root which can't access the Aqua session / WindowServer.
-# Direct launch as $RUNNER_USER gives Sunshine GUI access for screen capture.
+# Helper: launch a Sunshine binary and verify it is actually SERVING on port
+# 47990. Returns 0 if serving, 1 if it crashed or didn't open the port.
+# This catches the Qt-version-mismatch crash (dyld "Symbol not found") that
+# the brew binary can hit when Homebrew's qtbase bottle lags Sunshine's Qt.
+launch_and_verify_sunshine() {
+  local bin="$1"
+  local conf="$2"
+  local label="$3"
+  local errfile="$STATE_DIR/sunshine-launch-${label}.err"
+  rm -f "$errfile"; touch "$errfile"; chmod 666 "$errfile"
+  log "launching Sunshine ($label) as $RUNNER_USER ..."
+  # Launch in background as the GUI user, capture stderr for crash diagnostics.
+  gui_run "$bin" "$conf" 2>"$errfile" &
+  local pid=$!
+  disown 2>/dev/null || true
+  # Give it up to 20 seconds to open the HTTPS web/API port (47990).
+  if wait_for 20 port_open 47990; then
+    ok "Sunshine ($label) is serving on port 47990 (PID $pid)"
+    return 0
+  fi
+  # Port still not open — figure out why.
+  if kill -0 "$pid" 2>/dev/null; then
+    warn "Sunshine ($label) PID $pid is alive but port 47990 not listening after 20s"
+  else
+    warn "Sunshine ($label) PID $pid exited (crashed). stderr tail:"
+    tail -n 15 "$errfile" 2>/dev/null | while IFS= read -r line; do log "  $line"; done || true
+    # Detect the specific Qt-version-mismatch crash for a clearer message.
+    if grep -qE "Symbol not found|_qt_version_tag|dyld|Abort trap" "$errfile" 2>/dev/null; then
+      warn "  ↳ Qt version mismatch detected (Sunshine needs a newer Qt than Homebrew poured)."
+      warn "  ↳ Will fall back to the DMG build (bundles its own Qt)."
+    fi
+  fi
+  return 1
+}
+
+# Helper: install Sunshine from the DMG (bundles its own Qt = version-stable).
+install_sunshine_dmg() {
+  log "installing Sunshine from DMG (bundles own Qt — version-stable)..."
+  dmg_url="https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-macOS-arm64.dmg"
+  log "downloading $dmg_url..."
+  curl -fsSL "$dmg_url" -o /tmp/sunshine.dmg || { warn "could not download Sunshine DMG"; return 1; }
+  ok "downloaded $(du -h /tmp/sunshine.dmg | awk '{print $1}')"
+  log "mounting DMG..."
+  mount_output="$(hdiutil attach /tmp/sunshine.dmg -nobrowse 2>&1)" || { warn "could not mount DMG: $mount_output"; return 1; }
+  vol="$(echo "$mount_output" | grep -oE '/Volumes/[^ ]+' | head -1)"
+  [ -z "$vol" ] && { warn "could not find mounted volume in: $mount_output"; return 1; }
+  log "mounted at: $vol"
+  app_src="$(find "$vol" -name '*.app' -maxdepth 1 2>/dev/null | head -1)"
+  [ -z "$app_src" ] && { warn "could not find .app in DMG (contents: $(ls "$vol"))"; hdiutil detach "$vol" -quiet 2>/dev/null || true; return 1; }
+  log "copying $(basename "$app_src") to /Applications..."
+  cp -R "$app_src" /Applications/ || { warn "could not copy app"; hdiutil detach "$vol" -quiet 2>/dev/null || true; return 1; }
+  hdiutil detach "$vol" -quiet 2>/dev/null || true
+  rm -f /tmp/sunshine.dmg
+  xattr -dr com.apple.quarantine "$SUNSHINE_APP" 2>/dev/null || true
+  SUNSHINE_BIN="$SUNSHINE_APP/Contents/MacOS/sunshine"
+  SUNSHINE_BUNDLE="$(defaults read "$SUNSHINE_APP/Contents/Info" CFBundleIdentifier 2>/dev/null || echo 'com.lizardbyte.sunshine')"
+  ok "Sunshine installed via DMG: $SUNSHINE_APP (bundle: $SUNSHINE_BUNDLE)"
+  return 0
+}
+
+SUNSHINE_SERVING=false
+
+# Attempt 1: brew binary (if present) — fastest when it works.
 if [ -x "/opt/homebrew/opt/sunshine/bin/sunshine" ]; then
-  log "launching Sunshine as $RUNNER_USER (direct, not brew services)..."
-  gui_run /opt/homebrew/opt/sunshine/bin/sunshine "$SUNSHINE_CONFIG_DIR/sunshine.conf" &
-  sleep 8
-elif [ -d "$SUNSHINE_APP" ]; then
-  gui_run open -a Sunshine 2>/dev/null || true
-  sleep 5
+  if launch_and_verify_sunshine "/opt/homebrew/opt/sunshine/bin/sunshine" "$SUNSHINE_CONFIG_DIR/sunshine.conf" "brew"; then
+    SUNSHINE_SERVING=true
+    SUNSHINE_BIN="/opt/homebrew/opt/sunshine/bin/sunshine"
+  else
+    warn "brew Sunshine did not serve (likely Qt bottle mismatch) — will try DMG build"
+    sudo pkill -9 -f "sunshine" 2>/dev/null || true
+    pkill -9 -f "sunshine" 2>/dev/null || true
+    sleep 2
+  fi
 fi
 
-# Verify it's running
-if pgrep -f sunshine >/dev/null 2>&1; then
-  ok "Sunshine is running"
-  # Check which ports are actually listening
-  for p in 47984 47989 47990 47991 48010 48011; do
-    if lsof -nP -iTCP:"$p" 2>/dev/null | grep -q LISTEN; then
-      ok "  port $p: LISTENING"
-    else
-      warn "  port $p: not listening"
+# Attempt 2: DMG .app (installs if missing, then launches). Bundles its own Qt,
+# so it's immune to the Homebrew qtbase bottle version lag.
+if [ "$SUNSHINE_SERVING" = false ]; then
+  if [ ! -d "$SUNSHINE_APP" ]; then
+    if ! install_sunshine_dmg; then
+      warn "DMG install failed — Sunshine will not be available this session"
     fi
+  fi
+  if [ -x "$SUNSHINE_APP/Contents/MacOS/sunshine" ]; then
+    SUNSHINE_BIN="$SUNSHINE_APP/Contents/MacOS/sunshine"
+    SUNSHINE_BUNDLE="$(defaults read "$SUNSHINE_APP/Contents/Info" CFBundleIdentifier 2>/dev/null || echo 'com.lizardbyte.sunshine')"
+    if launch_and_verify_sunshine "$SUNSHINE_BIN" "$SUNSHINE_CONFIG_DIR/sunshine.conf" "dmg"; then
+      SUNSHINE_SERVING=true
+    fi
+  fi
+fi
+
+# Final verification + port dump
+if [ "$SUNSHINE_SERVING" = true ]; then
+  ok "Sunshine is running and serving"
+  for p in 47984 47989 47990 47991 48010 48011; do
+    if port_open "$p"; then ok "  port $p: LISTENING"; else warn "  port $p: not listening"; fi
   done
-  # Also dump the full lsof for sunshine-related ports
-  log "Sunshine port details:"
-  lsof -nP -iTCP -a -p "$(pgrep -f sunshine | head -1)" 2>/dev/null | while IFS= read -r line; do log "  $line"; done || true
-  log "Sunshine UDP ports:"
-  lsof -nP -iUDP -a -p "$(pgrep -f sunshine | head -1)" 2>/dev/null | while IFS= read -r line; do log "  $line"; done || true
+  log "Sunshine TCP port details:"
+  local_pid="$(pgrep -f 'sunshine' | grep -v $$ | head -1 || true)"
+  if [ -n "$local_pid" ]; then
+    lsof -nP -iTCP -a -p "$local_pid" 2>/dev/null | while IFS= read -r line; do log "  $line"; done || true
+    log "Sunshine UDP ports:"
+    lsof -nP -iUDP -a -p "$local_pid" 2>/dev/null | while IFS= read -r line; do log "  $line"; done || true
+  fi
 else
-  warn "Sunshine is NOT running — try launching it manually via RustDesk"
-  log "debug: processes matching sunshine:"
-  ps aux | grep -i sunshine | grep -v grep || true
+  warn "=============================================================="
+  warn "Sunshine could NOT be started (both brew + DMG attempts failed)."
+  warn "The PIN proxy + credentials setup will be SKIPPED for this session."
+  warn "Use RustDesk instead — see the RustDesk connection info printed above."
+  warn "=============================================================="
 fi
 
 # --- 5. start HTTP PIN proxy (no HTTPS, no cert warning) --------------------
+# Only meaningful if Sunshine is actually serving — otherwise the proxy has
+# no backend to talk to and pairing can never succeed.
+if [ "$SUNSHINE_SERVING" = true ]; then
+log "starting HTTP PIN proxy on port 8080 (Sunshine backend is up)..."
 # Sunshine's web UI is HTTPS-only (self-signed cert → browser warning).
 # Instead of dealing with certs, we start a simple HTTP server on port 8080
 # that serves a PIN entry form. The form POSTs the PIN to Sunshine's API
@@ -301,6 +408,7 @@ python3 "$PIN_PROXY" &
 PIN_PROXY_PID=$!
 disown 2>/dev/null || true
 log "PIN proxy started on port 8080 (HTTP — no cert warning)"
+fi  # end of "if SUNSHINE_SERVING" for pin proxy
 
 # --- 6. print connection info -----------------------------------------------
 TS_IP="$(cat "$STATE_DIR/tailscale-ip" 2>/dev/null || echo '<tailscale-ip>')"
@@ -310,9 +418,14 @@ log "=========================================================================="
 log "  SUNSHINE — Ultra-Low-Latency Streaming (alternative to RustDesk)"
 log "=========================================================================="
 log ""
+if [ "$SUNSHINE_SERVING" = true ]; then
 log "  HOST ............. Sunshine (running on this Mac)"
 log "  PIN page ......... http://$TS_IP:8080  (HTTP — no cert warning!)"
 log "    (simple form — enter the 4-digit PIN from Moonlight)"
+else
+log "  HOST ............. Sunshine (NOT running this session — see warnings above)"
+log "  PIN page ......... (disabled — Sunshine is not serving)"
+fi
 log ""
 log "  CLIENT ........... Moonlight (download on your device)"
 log "    Windows: https://moonlight-stream.org"
@@ -320,6 +433,7 @@ log "    macOS:   brew install --cask moonlight"
 log "    Android: Google Play → 'Moonlight Game Streaming'"
 log "    iOS:     App Store → 'Moonlight Game Streaming'"
 log ""
+if [ "$SUNSHINE_SERVING" = true ]; then
 log "  HOW TO PAIR (do this ONCE per session):"
 log "    1. Open Moonlight on your device → add host: $TS_IP"
 log "    2. Click the locked monitor icon → Moonlight shows a 4-digit PIN"
@@ -340,12 +454,20 @@ log "    - UDP streaming = less lag than TCP"
 log "    - Designed for gaming (<16ms latency)"
 log "    - 4K @ 120fps support"
 log ""
+log "  LATENCY TUNING (active this session):"
+log "    encoder=videotoolbox  max_bitrate=50000  qp=18  fec=20%  H.264  min_threads=2"
+log ""
 log "  PORTS (open on the Mac via Tailscale):"
 log "    47990 (HTTPS web UI)"
 log "    47984 (HTTPS — Moonlight pairing)"
 log "    47989 (HTTP — Moonlight API)"
 log "    48010 (UDP — control)"
 log "    47998-48000 (UDP — video/audio)"
+else
+log "  FALLBACK: Use RustDesk (connection info printed earlier) to control the Mac."
+log "  Sunshine could not start — usually a transient Homebrew Qt bottle mismatch."
+log "  Re-running the workflow often resolves it; the DMG fallback should cover it."
+fi
 log ""
 log "=========================================================================="
 
@@ -362,15 +484,21 @@ EOF
 
 
 # --- 6b. create credentials via Sunshine API (after launch) ---
-# On first run, Sunshine has no credentials → POST /api/password works without auth.
-# This is more reliable than manually writing the JSON file.
+# Only attempt this if Sunshine is actually serving — otherwise we waste ~20s
+# hitting a dead port (the original "attempt 1..10: no response" failure mode).
+if [ "$SUNSHINE_SERVING" = true ]; then
+log "creating Sunshine credentials via API..."
 # On first run, Sunshine has no credentials → POST /api/password works without auth.
 # The API requires: currentUsername, newUsername, currentPassword, newPassword,
 # confirmNewPassword + a CSRF token (from GET /api/csrf-token).
-log "creating Sunshine credentials via API..."
-# When username is empty (first run), POST /api/password doesn't need auth.
-# CSRF is bypassed if the Origin header matches csrf_allowed_origins.
+# Fail-fast: if port 47990 stops responding mid-loop, bail out early.
+CREDS_CREATED=false
 for attempt in $(seq 1 10); do
+  # Guard: bail out immediately if Sunshine died since we started serving.
+  if ! port_open 47990; then
+    warn "Sunshine stopped serving mid-credentials (port 47990 closed) — aborting credential creation"
+    break
+  fi
   RESP=$(curl -skL -X POST \
     -H "Content-Type: application/json" \
     -H "Origin: https://localhost:47990" \
@@ -378,19 +506,32 @@ for attempt in $(seq 1 10); do
     "https://localhost:47990/api/password" 2>/dev/null) || true
   if echo "$RESP" | grep -q '"status":true' 2>/dev/null; then
     ok "Sunshine credentials created via API ($SUNSHINE_USER_VAL)"
+    CREDS_CREATED=true
     break
   else
     log "  attempt $attempt: ${RESP:-no response}"
   fi
   sleep 2
 done
+if [ "$CREDS_CREATED" = false ]; then
+  warn "Sunshine credentials were NOT created via API."
+  warn "You can still create them manually via the web UI at https://$TS_IP:47990"
+fi
+fi  # end of credentials-API block
 
 # --- 7. open macOS firewall for Sunshine UDP ports --------------------------
 # Moonlight needs UDP ports 47998-48000 (video/control/audio) + 48010 (RTSP)
 # The macOS application firewall may block these by default.
 sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off 2>/dev/null || true
-sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "$SUNSHINE_BIN" 2>/dev/null || true
-sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$SUNSHINE_BIN" 2>/dev/null || true
+if [ -n "${SUNSHINE_BIN:-}" ]; then
+  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "$SUNSHINE_BIN" 2>/dev/null || true
+  sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$SUNSHINE_BIN" 2>/dev/null || true
+  # If we have the .app, also allow the whole bundle (covers helper processes).
+  if [ -d "$SUNSHINE_APP" ]; then
+    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add "$SUNSHINE_APP" 2>/dev/null || true
+    sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp "$SUNSHINE_APP" 2>/dev/null || true
+  fi
+fi
 ok "macOS firewall configured for Sunshine"
 
 # --- 8. print clear PIN instructions ----------------------------------------
@@ -398,7 +539,7 @@ ok "macOS firewall configured for Sunshine"
 # - Moonlight generates a random 4-digit PIN on the CLIENT side
 # - The PIN is NOT available via Sunshine's API
 # - The user MUST enter the PIN manually in the Sunshine web UI
-# 
+#
 # Pairing flow:
 # 1. Moonlight shows a 4-digit PIN (e.g., 1788) on YOUR device
 # 2. Open https://<tailscale-ip>:47990/pin in your browser
@@ -406,4 +547,8 @@ ok "macOS firewall configured for Sunshine"
 # 4. Enter the 4-digit PIN from Moonlight
 # 5. Pairing completes — Moonlight connects automatically
 
+if [ "$SUNSHINE_SERVING" = true ]; then
 ok "Sunshine setup complete — see PIN instructions above"
+else
+warn "Sunshine setup INCOMPLETE — use RustDesk instead (connection info above)"
+fi
